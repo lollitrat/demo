@@ -1,145 +1,113 @@
 import os
 import requests
-from flask import Flask, request
+from flask import Flask, request, jsonify
 from dotenv import load_dotenv
+from twilio.twiml.messaging_response import MessagingResponse
 
-# Load .env
+# -----------------------------
+# Load environment variables
+# -----------------------------
 load_dotenv()
 
 app = Flask(__name__)
 
-# Environment variables
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
-
-PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN")  # Messenger Page token
-PAGE_ID = os.getenv("PAGE_ID")  # Messenger Page ID
-
 VOICEFLOW_API_KEY = os.getenv("VOICEFLOW_API_KEY")
 VOICEFLOW_VERSION_ID = os.getenv("VOICEFLOW_VERSION_ID")
+VF_BASE = os.getenv("VOICEFLOW_RUNTIME_URL", "https://general-runtime.voiceflow.com")
+RESPONDIO_SECRET = os.getenv("RESPONDIO_SECRET")  # optional
 
-VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "voiceflow123")
+# =========================================================
+# ✅ Respond.io webhook
+# =========================================================
+@app.route("/respondio-webhook", methods=["POST"])
+def respondio_webhook():
+    # Check secret header
+    secret = request.headers.get("X-Respondio-Secret")
+    if RESPONDIO_SECRET and secret != RESPONDIO_SECRET:
+        return jsonify({"error": "unauthorized"}), 401
 
-# ✅ Webhook verification (shared for WhatsApp + Messenger)
-@app.route("/webhook", methods=["GET"])
-def verify():
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
+    data = request.get_json(force=True)
+    print("📩 Respond.io payload:", data)
 
-    if mode == "subscribe" and token == VERIFY_TOKEN:
-        print("✅ Webhook verified")
-        return challenge, 200
-    return "Forbidden", 403
+    contact = data.get("contact", {})
+    contact_id = contact.get("id") or contact.get("phone") or "unknown_user"
+
+    # Extract message text
+    text = None
+    if data.get("data"):
+        text = data["data"].get("text")
+    if not text and data.get("message"):
+        text = data["message"].get("text")
+    if not text:
+        text = ""
+
+    replies = get_voiceflow_replies(contact_id, text)
+
+    response_payload = {"messages": [{"text": r} for r in replies]}
+    print("↩️ Respond.io response payload:", response_payload)
+
+    return jsonify(response_payload), 200
 
 
-# ✅ Webhook receiver
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    data = request.get_json()
-    print("📩 Incoming webhook payload:", data)
+# =========================================================
+# ✅ Twilio WhatsApp webhook
+# =========================================================
+@app.route("/twilio-webhook", methods=["POST"])
+def twilio_webhook():
+    data = request.form.to_dict()
+    print("📩 Incoming Twilio WhatsApp:", data)
 
+    user_msg = data.get("Body", "")
+    user_id = data.get("From", "unknown_user")
+
+    replies = get_voiceflow_replies(user_id, user_msg)
+
+    # Build TwiML response
+    resp = MessagingResponse()
+    for r in replies:
+        resp.message(r)
+
+    print("↩️ Twilio response payload:", replies)
+    return str(resp)
+
+
+# =========================================================
+# 🔹 Shared helper to query Voiceflow
+# =========================================================
+def get_voiceflow_replies(user_id: str, text: str):
     try:
-        if "object" in data:
-            # WhatsApp handler
-            if data["object"] == "whatsapp_business_account":
-                for entry in data.get("entry", []):
-                    for change in entry.get("changes", []):
-                        value = change.get("value", {})
-                        if "messages" in value:
-                            for message in value["messages"]:
-                                user_id = message["from"]
-                                user_text = message.get("text", {}).get("body", "")
-                                print(f"👉 WhatsApp message from {user_id}: {user_text}")
+        if VOICEFLOW_VERSION_ID:
+            url = f"{VF_BASE}/state/{VOICEFLOW_VERSION_ID}/user/{user_id}/interact"
+        else:
+            url = f"{VF_BASE}/state/user/{user_id}/interact"
 
-                                handle_voiceflow_and_reply(user_id, user_text, platform="whatsapp")
-
-            # Messenger handler
-            elif data["object"] == "page":
-                for entry in data.get("entry", []):
-                    for messaging_event in entry.get("messaging", []):
-                        sender_id = messaging_event.get("sender", {}).get("id")
-                        message_text = messaging_event.get("message", {}).get("text")
-
-                        if sender_id and message_text:
-                            print(f"👉 Messenger message from {sender_id}: {message_text}")
-                            handle_voiceflow_and_reply(sender_id, message_text, platform="messenger")
-
+        vf_resp = requests.post(
+            url,
+            headers={"Authorization": VOICEFLOW_API_KEY, "Content-Type": "application/json"},
+            json={"request": {"type": "text", "payload": text}},
+            timeout=15,
+        )
+        vf_resp.raise_for_status()
+        vf_data = vf_resp.json()
+        print("🔵 Voiceflow raw reply:", vf_data)
     except Exception as e:
-        print("❌ ERROR in webhook:", str(e))
+        print("❌ Voiceflow error:", e)
+        return ["Sorry, I'm having trouble right now."]
 
-    return "EVENT_RECEIVED", 200
+    replies = []
+    if isinstance(vf_data, list):
+        for item in vf_data:
+            if item.get("type") == "text":
+                msg = item.get("payload", {}).get("message") or item.get("message")
+                if msg:
+                    replies.append(msg)
 
+    if not replies:
+        replies = ["Sorry, I don’t have an answer for that right now."]
 
-# ✅ Helper function: Forward to Voiceflow and send reply
-def handle_voiceflow_and_reply(user_id, user_text, platform="whatsapp"):
-    try:
-        # Send to Voiceflow
-        vf_response = requests.post(
-            f"https://general-runtime.voiceflow.com/state/user/{user_id}/interact",
-            headers={
-                "Authorization": VOICEFLOW_API_KEY,
-                "Content-Type": "application/json"
-            },
-            json={"action": {"type": "text", "payload": user_text}}
-        )
-
-        print("🔵 Voiceflow status:", vf_response.status_code)
-        print("🔵 Voiceflow raw response:", vf_response.text)
-
-        if vf_response.status_code == 200:
-            reply_data = vf_response.json()
-            bot_replies = []
-
-            for item in reply_data:
-                if item.get("type") == "text":
-                    msg = item.get("payload", {}).get("message")
-                    if msg:
-                        bot_replies.append(msg)
-
-            if not bot_replies:
-                print("⚠️ No text replies found from Voiceflow")
-            else:
-                for bot_reply in bot_replies:
-                    print(f"🤖 Replying on {platform} to {user_id}: {bot_reply}")
-                    send_message(user_id, bot_reply, platform)
-
-    except Exception as e:
-        print("❌ Error in handle_voiceflow_and_reply:", str(e))
+    return replies
 
 
-# ✅ Send message (WhatsApp or Messenger)
-def send_message(user_id, text, platform="whatsapp"):
-    if platform == "whatsapp":
-        wa_response = requests.post(
-            f"https://graph.facebook.com/v17.0/{PHONE_NUMBER_ID}/messages",
-            headers={
-                "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "messaging_product": "whatsapp",
-                "to": user_id,
-                "type": "text",
-                "text": {"body": text}
-            }
-        )
-        print("🟢 WhatsApp status:", wa_response.status_code)
-        print("🟢 WhatsApp response:", wa_response.text)
-
-    elif platform == "messenger":
-        ms_response = requests.post(
-            f"https://graph.facebook.com/v17.0/me/messages",
-            params={"access_token": PAGE_ACCESS_TOKEN},
-            headers={"Content-Type": "application/json"},
-            json={
-                "recipient": {"id": user_id},
-                "message": {"text": text}
-            }
-        )
-        print("🟢 Messenger status:", ms_response.status_code)
-        print("🟢 Messenger response:", ms_response.text)
-
-
+# =========================================================
 if __name__ == "__main__":
     app.run(port=5000, debug=True)
